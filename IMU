@@ -1,0 +1,179 @@
+import time
+import smbus2
+import math
+
+# Open the I2C bus
+bus = smbus2.SMBus(1)
+
+# I2C addresses for the sensors
+IMU_ADDR = 0x69  # ICM20600 address
+TEMP_HUMIDITY_SENSOR_ADDR = 0x44
+COMPASS_ADDR = 0x0C  # AK09918 compass address
+
+# Gyroscope scaling factor (example for 500 dps sensitivity level)
+GYRO_SENSITIVITY = 65.5  # LSB/dps
+
+# Accelerometer scaling factors
+ACCEL_SENSITIVITY = 16384  # LSB/g
+G_TO_MS2 = 9.81  # Conversion factor from g to m/s^2
+
+# Add this line to convert degrees to radians
+DEG_TO_RAD = math.pi / 180
+
+def initialize_imu():
+    # Reset device
+    bus.write_byte_data(IMU_ADDR, 0x6B, 0x80)  # PWR_MGMT_1 register
+    time.sleep(0.1)
+
+    # Exit sleep mode
+    bus.write_byte_data(IMU_ADDR, 0x6B, 0x00)  # PWR_MGMT_1 register
+    time.sleep(0.1)
+
+    # Configure gyroscope
+    bus.write_byte_data(IMU_ADDR, 0x1B, 0x00)  # GYRO_CONFIG register
+
+    # Configure accelerometer
+    bus.write_byte_data(IMU_ADDR, 0x1C, 0x00)  # ACCEL_CONFIG register
+
+def initialize_compass():
+    # Configure AK09918 compass
+    
+    # Reset device
+    bus.write_byte_data(COMPASS_ADDR, 0x0B, 0x01)  # AK09918_CNTL3 register
+    time.sleep(0.01)
+    
+    # Power down the device
+    bus.write_byte_data(COMPASS_ADDR, 0x31, 0x00)  # AK09918_CNTL2 register
+    time.sleep(0.01)
+    
+    # Enter Fuse ROM access mode
+    bus.write_byte_data(COMPASS_ADDR, 0x0A, 0x1F)  # AK09918_CNTL2 register
+    time.sleep(0.01)
+    
+    # Configure the device for continuous measurement mode (mode 0x01)
+    bus.write_byte_data(COMPASS_ADDR, 0x31, 0x01)  # AK09918_CNTL2 register
+    time.sleep(0.01)
+
+# Function to read temperature and humidity from SHT31 sensor
+def read_temp_humidity():
+    bus.write_i2c_block_data(TEMP_HUMIDITY_SENSOR_ADDR, 0x2C, [0x06])  # Send command to measure temperature and humidity
+    time.sleep(0.5)  # Wait for measurement to complete
+
+    # Read data from sensor (6 bytes: 2 bytes temperature, 2 bytes humidity, 2 bytes CRC)
+    data = bus.read_i2c_block_data(TEMP_HUMIDITY_SENSOR_ADDR, 0x00, 6)
+
+    # Combine bytes to form temperature and humidity values
+    temperature = ((data[0] << 8) + data[1]) * 175 / 65535 - 45  # Formula from datasheet to convert raw data to temperature in degrees Celsius
+    humidity = ((data[3] << 8) + data[4]) * 100 / 65535  # Formula from datasheet to convert raw data to relative humidity
+
+    return temperature, humidity
+
+def read_word_2c(reg, device_addr):
+    # Read a 16-bit signed integer from the device
+    high = bus.read_byte_data(device_addr, reg)
+    low = bus.read_byte_data(device_addr, reg + 1)
+    value = (high << 8) + low
+    if value >= 0x8000:
+        return -((65535 - value) + 1)
+    else:
+        return value
+
+def read_accelerometer():
+    x_sum = y_sum = z_sum = 0
+
+    for _ in range(100):  # Read 100 samples
+        x = read_word_2c(0x3B, IMU_ADDR)
+        y = read_word_2c(0x3D, IMU_ADDR)
+        z = read_word_2c(0x3F, IMU_ADDR)
+
+        x_sum += x
+        y_sum += y
+        z_sum += z
+
+    avg_x = (x_sum / 100) / ACCEL_SENSITIVITY * G_TO_MS2
+    avg_y = (y_sum / 100) / ACCEL_SENSITIVITY * G_TO_MS2
+    avg_z = (z_sum / 100) / ACCEL_SENSITIVITY * G_TO_MS2
+
+    return avg_x, avg_y, avg_z
+
+def read_gyroscope():
+    x_sum = y_sum = z_sum = 0
+
+    for _ in range(100):  # Read 100 samples
+        x = read_word_2c(0x43, IMU_ADDR) / GYRO_SENSITIVITY * DEG_TO_RAD
+        y = read_word_2c(0x45, IMU_ADDR) / GYRO_SENSITIVITY * DEG_TO_RAD
+        z = read_word_2c(0x47, IMU_ADDR) / GYRO_SENSITIVITY * DEG_TO_RAD
+
+        x_sum += x
+        y_sum += y
+        z_sum += z
+
+    avg_x = x_sum / 100
+    avg_y = y_sum / 100
+    avg_z = z_sum / 100
+
+    return avg_x, avg_y, avg_z
+
+def read_compass_heading():
+    # Read compass heading from AK09918
+    data = bus.read_i2c_block_data(COMPASS_ADDR, 0x11, 6)  # Read 6 bytes starting from HXL register
+    
+    # Combine low and high bytes for X, Y, Z magnetometer data
+    mag_x = (data[1] << 8) | data[0]
+    mag_y = (data[3] << 8) | data[2]
+    mag_z = (data[5] << 8) | data[4]
+    
+    # Print raw magnetometer data
+    print("Raw Magnetometer Data (X,Y,Z): {}, {}, {}".format(mag_x, mag_y, mag_z))
+    
+    # Convert magnetometer data to microteslas (uT)
+    scale = 0.15  # Scale factor for 16-bit resolution (0.15uT/LSB)
+    mag_x *= scale
+    mag_y *= scale
+    mag_z *= scale
+    
+    # Calculate heading in degrees
+    heading = math.atan2(mag_y, mag_x) * (180 / math.pi)
+    if heading < 0:
+        heading += 360
+    
+    print("Heading: {:.2f} degrees".format(heading))
+    
+    return heading
+
+
+
+# Call the initialization functions
+initialize_imu()
+initialize_compass()
+
+try:
+    while True:
+        start_time = time.time()
+
+        # Read sensor data
+        accel_data = read_accelerometer()
+        gyro_data = read_gyroscope()
+        temp, humidity = read_temp_humidity()
+
+        # Read compass heading
+        heading = read_compass_heading()
+
+        # Print sensor data with units and formatting
+        print("Accelerometer (X,Y,Z): ({:.2f} m/s^2, {:.2f} m/s^2, {:.2f} m/s^2)".format(accel_data[0], accel_data[1], accel_data[2]))
+        print("Gyroscope (X,Y,Z): ({:.2f} */s, {:.2f} */s, {:.2f} */s)".format(gyro_data[0], gyro_data[1], gyro_data[2]))
+        print("Temperature: {:.2f} *C".format(temp))
+        print("Humidity: {:.2f}%".format(humidity))
+        
+        # Print compass heading
+        print("Heading: {:.2f} degrees".format(heading))
+
+        # Calculate elapsed time and adjust sleep time
+        elapsed_time = time.time() - start_time
+        sleep_time = max(0, 0.5 - elapsed_time)
+        time.sleep(sleep_time)
+
+except KeyboardInterrupt:
+    print("Program stopped by the user.")
+finally:
+    bus.close()
